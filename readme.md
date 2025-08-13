@@ -49,15 +49,7 @@ In your `MCPigeon/settings.py`:
 ```python
 # settings.py
 
-INSTALLED_APPS = [
-    # ...
-    "django.contrib.sites",
-    "campaigns",
-    "django_mcp_server", # If using MCP tools
-]
-
 # Required for tracking links, unsubscribe URLs, etc.
-SITE_ID = 1
 CAMPAIGNS_PUBLIC_BASE_URL = "https://your.domain.com"
 
 # Celery configuration (example using Redis)
