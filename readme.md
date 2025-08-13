@@ -379,4 +379,4 @@ These call the same core sender/stats functions as the Admin/CLI. Wire once you�
 ## Credits
 
 Built for agentic workflows by folks who like their email where they can see it — **in the mailbox**.
-Mascot & brand: **MC Pigeon** 🐦🎤
+Mascot & brand: **MC Pigeon** 🐦🎤 (vibe coded in 36 hours off a prime and bag of twizzlers, and the help of gemini, Sonnet, and GPT 5. Logo sora.)
