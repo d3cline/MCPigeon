@@ -194,7 +194,8 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'campaigns',
-    'mcp_server'
+    'mcp_server',
+    'axes',
 ]
 
 MIDDLEWARE = [
@@ -205,7 +206,13 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    "axes.middleware.AxesMiddleware"
 ]
+
+AUTHENTICATION_BACKENDS = [
+    "axes.backends.AxesBackend",  # keep first
+]
+
 
 ROOT_URLCONF = 'MCPigeon.urls'
 
@@ -288,3 +295,8 @@ if _broker:
 if _backend:
     CELERY_RESULT_BACKEND = _backend
 CELERY_TASK_DEFAULT_QUEUE = _os.getenv("CELERY_TASK_DEFAULT_QUEUE", "mcpigeon")
+
+# Optional but sensible:
+AXES_FAILURE_LIMIT = 5
+AXES_COOLOFF_TIME = 1  # hours
+AXES_RESET_ON_SUCCESS = True
