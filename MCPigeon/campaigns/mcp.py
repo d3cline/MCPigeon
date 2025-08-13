@@ -409,3 +409,307 @@ class CampaignTools(MCPToolset):
 
 # Make an instance of the tool available.
 campaigns = CampaignTools().campaigns
+
+
+
+# ────────────────────────────────────────────────────────────
+# Mailbox Tool — CRUD + verify + remote provisioning
+# ────────────────────────────────────────────────────────────
+
+import smtplib, imaplib, ssl
+from contextlib import closing
+
+try:
+    # Optional: only needed if you want cross-MCP provisioning
+    from modules.mcp.utils import MCPTransport  # your lightweight HTTP bridge
+except Exception:  # pragma: no cover
+    MCPTransport = None  # graceful fallback
+
+class MailboxTools(MCPToolset):
+    """
+    Manage Mailbox rows locally, verify credentials against providers,
+    and (optionally) provision a mailbox by calling a *remote* MCP tool.
+    """
+
+    # -------- CRUD --------
+    def _list(self, payload):
+        qs = Mailbox.objects.all().order_by("id")
+        return [_serialize(m) for m in _maybe_limit(qs, payload)]
+
+    def _read(self, payload):
+        return _serialize(_get(Mailbox, payload["id"]))
+
+    def _create(self, payload):
+        return _serialize(Mailbox.objects.create(**payload))
+
+    def _update(self, payload):
+        obj_id = payload.pop("id")
+        return _serialize(_apply_updates(_get(Mailbox, obj_id), payload))
+
+    def _delete(self, payload):
+        obj = _get(Mailbox, payload["id"])
+        obj.delete()
+        return {"ok": True}
+
+    # -------- Extras --------
+    def _verify(self, payload):
+        """
+        Try SMTP (STARTTLS if configured) and IMAP (SSL or STARTTLS),
+        returning per-protocol pass/fail and any error strings.
+        """
+        mb = _get(Mailbox, payload["id"])
+
+        smtp_ok = False
+        smtp_err = None
+        imap_ok = False
+        imap_err = None
+
+        # SMTP
+        try:
+            if mb.smtp_starttls:
+                with closing(smtplib.SMTP(mb.smtp_host, mb.smtp_port, timeout=15)) as s:
+                    s.ehlo()
+                    s.starttls(context=ssl.create_default_context())
+                    s.ehlo()
+                    s.login(mb.smtp_username, mb.smtp_password)
+            else:
+                with closing(smtplib.SMTP_SSL(mb.smtp_host, mb.smtp_port, timeout=15, context=ssl.create_default_context())) as s:
+                    s.login(mb.smtp_username, mb.smtp_password)
+            smtp_ok = True
+        except Exception as e:
+            smtp_err = str(e)
+
+        # IMAP
+        try:
+            if mb.imap_ssl:
+                with closing(imaplib.IMAP4_SSL(mb.imap_host, mb.imap_port, ssl_context=ssl.create_default_context())) as im:
+                    im.login(mb.imap_username, mb.imap_password)
+            else:
+                with closing(imaplib.IMAP4(mb.imap_host, mb.imap_port)) as im:
+                    im.starttls(ssl_context=ssl.create_default_context())
+                    im.login(mb.imap_username, mb.imap_password)
+            imap_ok = True
+        except Exception as e:
+            imap_err = str(e)
+
+        return {
+            "ok": smtp_ok and imap_ok,
+            "smtp": {"ok": smtp_ok, "error": smtp_err},
+            "imap": {"ok": imap_ok, "error": imap_err},
+        }
+
+    def _provision_via_mcp(self, payload):
+        """
+        Call a *remote* MCP tool to create a mailbox there, then persist locally.
+
+        Contract (you provide):
+          remote:
+            base_url: str
+            bearer_token: str
+            tool: str                 # e.g. "opal.mailboxes" (remote tool name)
+            action: str               # e.g. "create"
+            tool_payload: dict        # whatever that remote tool expects
+
+          local_fields (optional override): dict
+            # If present, use these exact fields for the local Mailbox create,
+            # otherwise we try to map from the remote response.
+
+        Return shape:
+          { ok, remote_response, mailbox?: { ...serialized... } }
+        """
+        remote = payload.get("remote") or {}
+        local_fields = payload.get("local_fields")
+
+        if MCPTransport is None:
+            return {"ok": False, "error": "MCPTransport not available in this runtime"}
+
+        base_url = remote.get("base_url")
+        token = remote.get("bearer_token")
+        tool = remote.get("tool")
+        action = remote.get("action")
+        tool_payload = remote.get("tool_payload") or {}
+
+        if not all([base_url, token, tool, action]):
+            return {"ok": False, "error": "Missing remote.base_url, bearer_token, tool, or action"}
+
+        http = MCPTransport(base_url=base_url, bearer_token=token)
+
+        # Fire the remote tool
+        try:
+            remote_resp = http.call_tool(tool_name=tool, action=action, payload=tool_payload)
+        except Exception as e:
+            return {"ok": False, "error": f"Remote MCP call failed: {e}"}
+
+        # If caller supplied explicit local fields, use them; otherwise map a sane default
+        if local_fields is None:
+            # Heuristic mapping from a typical mailbox provisioning response.
+            # Adjust mapping as needed to your remote tool’s response shape.
+            rr = remote_resp if isinstance(remote_resp, dict) else {}
+            creds = rr.get("credentials", rr)  # try nested
+            # Build Mailbox kwargs; required fields must be present.
+            try:
+                local_fields = {
+                    "name": rr.get("name") or creds.get("name") or "remote-mailbox",
+                    "from_name": rr.get("from_name") or "",
+                    "from_email": rr.get("from_email") or creds["from_email"],
+                    "smtp_host": creds.get("smtp_host") or rr["smtp_host"],
+                    "smtp_port": int(creds.get("smtp_port", rr.get("smtp_port", 587))),
+                    "smtp_starttls": bool(creds.get("smtp_starttls", rr.get("smtp_starttls", True))),
+                    "smtp_username": creds.get("smtp_username") or rr["smtp_username"],
+                    "smtp_password": creds.get("smtp_password") or rr["smtp_password"],
+                    "imap_host": creds.get("imap_host") or rr["imap_host"],
+                    "imap_port": int(creds.get("imap_port", rr.get("imap_port", 993))),
+                    "imap_ssl": bool(creds.get("imap_ssl", rr.get("imap_ssl", True))),
+                    "imap_username": creds.get("imap_username") or rr["imap_username"],
+                    "imap_password": creds.get("imap_password") or rr["imap_password"],
+                    "sent_folder": rr.get("sent_folder", "Sent"),
+                    "bounce_folder": rr.get("bounce_folder", "INBOX"),
+                }
+            except KeyError as ke:
+                return {"ok": False, "error": f"Remote response missing key for local create: {ke}", "remote_response": remote_resp}
+
+        # Create locally
+        mb = Mailbox.objects.create(**local_fields)
+        return {"ok": True, "remote_response": remote_resp, "mailbox": _serialize(mb)}
+
+    def mailboxes(
+        self,
+        action: Literal[
+            "list", "read", "create", "update", "delete",
+            "verify", "provision_via_mcp"
+        ],
+        payload: Dict[str, Any] | None = None,
+    ):
+        """
+        ---
+        name: mailboxes
+        description: CRUD + verification and cross-MCP provisioning for Mailbox rows.
+        parameters:
+          type: object
+          properties:
+            action:
+              type: string
+              enum: [list, read, create, update, delete, verify, provision_via_mcp]
+            payload: { type: object }
+          required: [action]
+
+        actions:
+          list:
+            summary: List all mailboxes.
+            payload:
+              type: object
+              properties:
+                limit: {type: integer}
+                filters: {type: object}
+          read:
+            summary: Fetch one mailbox by id.
+            payload:
+              type: object
+              properties: { id: {type: integer} }
+              required: [id]
+          create:
+            summary: Create a mailbox (local row).
+            payload:
+              type: object
+          update:
+            summary: Update a mailbox (local row).
+            payload:
+              type: object
+              properties: { id: {type: integer} }
+              required: [id]
+          delete:
+            summary: Delete a mailbox (local row).
+            payload:
+              type: object
+              properties: { id: {type: integer} }
+              required: [id]
+          verify:
+            summary: Check SMTP/IMAP connectivity for this mailbox id.
+            payload:
+              type: object
+              properties: { id: {type: integer} }
+              required: [id]
+          provision_via_mcp:
+            summary: Call a remote MCP tool to create a mailbox, then store it locally.
+            payload:
+              type: object
+              properties:
+                remote:
+                  type: object
+                  properties:
+                    base_url: {type: string}
+                    bearer_token: {type: string}
+                    tool: {type: string}
+                    action: {type: string}
+                    tool_payload: {type: object}
+                  required: [base_url, bearer_token, tool, action]
+                local_fields:
+                  type: object
+                  description: Optional explicit fields for the local Mailbox create.
+        ...
+        """
+        payload = payload or {}
+        try:
+            action_map = {
+                "list": self._list,
+                "read": self._read,
+                "create": self._create,
+                "update": self._update,
+                "delete": self._delete,
+                "verify": self._verify,
+                "provision_via_mcp": self._provision_via_mcp,
+            }
+            return action_map[action](payload)
+        except (KeyError, ValidationError, ObjectDoesNotExist) as e:
+            return {"ok": False, "error": str(e)}
+
+
+# Make an instance of the tool available.
+mailboxes = MailboxTools().mailboxes
+
+
+# ────────────────────────────────────────────────────────────
+# Campaign ↔ Mailbox convenience tool
+# ────────────────────────────────────────────────────────────
+
+class CampaignMailboxTools(MCPToolset):
+    """Tiny helper to assign/switch a campaign’s mailbox."""
+
+    def _assign(self, payload: Dict[str, Any]):
+        cid = payload["campaign_id"]
+        mid = payload["mailbox_id"]
+        c = _get(Campaign, cid)
+        m = _get(Mailbox, mid)
+        c.mailbox_id = m.id
+        c.save(update_fields=["mailbox"])
+        return {"ok": True, "campaign_id": c.id, "mailbox_id": m.id}
+
+    def campaign_mailbox(
+        self,
+        action: Literal["assign"],
+        payload: Dict[str, Any] | None = None,
+    ):
+        """
+        ---
+        name: campaign_mailbox
+        description: Assign or switch a campaign’s mailbox.
+        parameters:
+          type: object
+          properties:
+            action: {type: string, enum: [assign]}
+            payload:
+              type: object
+              properties:
+                campaign_id: {type: integer}
+                mailbox_id: {type: integer}
+              required: [campaign_id, mailbox_id]
+          required: [action]
+        ...
+        """
+        payload = payload or {}
+        try:
+            return {"assign": self._assign}[action](payload)
+        except (KeyError, ValidationError, ObjectDoesNotExist) as e:
+            return {"ok": False, "error": str(e)}
+
+campaign_mailbox = CampaignMailboxTools().campaign_mailbox
