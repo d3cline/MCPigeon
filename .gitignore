@@ -1,0 +1,52 @@
+# Django/Python standard ignores
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg
+*.egg-info/
+dist/
+build/
+.env
+env/
+venv/
+ENV/
+
+# Django specific
+*.sqlite3
+db.sqlite3
+media/
+staticfiles/
+local_settings.py
+settings_local.py
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Coverage
+.coverage
+htmlcov/
+
+# Migrations
+**/migrations/*.pyc
+**/migrations/*.pyo
+**/migrations/*.py
+!**/migrations/__init__.py
+
+# Test
+.test/
+
+# Other
+*.swp
+*.swo
+
+# Ignore secrets
+secrets.json
