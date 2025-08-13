@@ -171,8 +171,6 @@ class CampaignTools(MCPToolset):
     def _send(self, payload: Dict[str, Any]):
         campaign_id = payload["campaign_id"]
         dry_run = bool(payload.get("dry_run", False))
-        batch_size = payload.get("batch_size")
-        sleep = payload.get("sleep")
 
         try:
             campaign = _get(Campaign, campaign_id)
@@ -189,7 +187,7 @@ class CampaignTools(MCPToolset):
             }
 
         # Always pass campaign.id to the task
-        task = send_campaign_task.delay(campaign.id, batch_size=batch_size, sleep=sleep)
+        task = send_campaign_task.delay(campaign.id)
         campaign.status = Campaign.SENDING
         campaign.save()
 
@@ -352,8 +350,6 @@ class CampaignTools(MCPToolset):
               properties:
                 campaign_id: {type: integer}
                 dry_run: {type: boolean, default: false}
-                batch_size: {type: integer, nullable: true}
-                sleep: {type: number, nullable: true}
               required: [campaign_id]
             response:
               type: object
