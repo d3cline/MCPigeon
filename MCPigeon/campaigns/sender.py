@@ -22,8 +22,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("campaigns.sender")
 
+# Connection timeouts (connect/handshake). Operation timeouts are handled separately.
 SMTP_CONNECT_TIMEOUT = float(os.getenv("CAMPAIGNS_SMTP_TIMEOUT", "30"))
 IMAP_CONNECT_TIMEOUT = float(os.getenv("CAMPAIGNS_IMAP_TIMEOUT", "30"))
+
+# Per-operation timeout for IMAP APPEND specifically (prevents hangs)
+IMAP_APPEND_TIMEOUT = float(os.getenv("CAMPAIGNS_IMAP_APPEND_TIMEOUT", "8"))
+
 SMTP_DEBUG_WIRE = bool(int(os.getenv("CAMPAIGNS_SMTP_DEBUG", "0")))
 
 try:
@@ -33,12 +38,43 @@ except ImportError:
 
 @contextmanager
 def socket_timeout(seconds: float):
+    """
+    Sets the *global* default socket timeout for NEW sockets. Note: this does NOT
+    affect already-open sockets (e.g., an existing IMAP connection). Kept for
+    connect-time limits; not used for per-op timeouts.
+    """
     prev = socket.getdefaulttimeout()
     socket.setdefaulttimeout(seconds)
     try:
         yield
     finally:
         socket.setdefaulttimeout(prev)
+
+@contextmanager
+def imap_op_timeout(imap_conn, seconds: float):
+    """
+    Temporarily set a timeout on the underlying IMAP socket for a single operation.
+    This *does* affect ongoing reads/writes on that IMAP connection.
+    """
+    sock = getattr(imap_conn, "sock", None)
+    prev = None
+    try:
+        if sock is not None:
+            try:
+                prev = sock.gettimeout()
+            except Exception:
+                prev = None
+            try:
+                sock.settimeout(seconds)
+            except Exception:
+                pass
+        yield
+    finally:
+        if sock is not None:
+            try:
+                sock.settimeout(prev)
+            except Exception:
+                pass
 
 def _to_html_from_markdown(md_text: str) -> str:
     if _markdown_lib:
@@ -107,14 +143,15 @@ def smtp_session(mailbox):
     ctx = ssl.create_default_context()
     s = None
     try:
+        # Connection-level timeout
         if mode == "SSL":
             s = smtplib.SMTP_SSL(host, port, context=ctx, timeout=SMTP_CONNECT_TIMEOUT)
         else:
             s = smtplib.SMTP(host, port, timeout=SMTP_CONNECT_TIMEOUT)
-        
+
         if SMTP_DEBUG_WIRE:
             s.set_debuglevel(1)
-        
+
         s.ehlo()
         if mode == "STARTTLS":
             s.starttls(context=ctx)
@@ -136,6 +173,7 @@ def imap_session(mailbox):
     use_ssl = bool(getattr(mailbox, "imap_ssl", True))
     imap = None
     try:
+        # Connection-level timeout for connect/login only
         with socket_timeout(IMAP_CONNECT_TIMEOUT):
             imap = imaplib.IMAP4_SSL(host, port) if use_ssl else imaplib.IMAP4(host, port)
         imap.login(mailbox.imap_username or "", mailbox.imap_password)
@@ -148,50 +186,79 @@ def imap_session(mailbox):
                 pass
 
 def send_campaign_batch(campaign_id: int, recipient_ids: list[int]) -> int:
+    """
+    Send to the given recipient IDs for a campaign.
+    Returns the count of SMTP successes. IMAP 'Sent' archiving is best-effort and
+    does NOT affect the success count (to avoid hangs causing false negatives).
+    """
     from .models import Campaign, Recipient, MessageInstance
-    
+
     try:
         campaign = Campaign.objects.select_related("mailbox").get(id=campaign_id)
     except Campaign.DoesNotExist:
-        logger.error(f"Campaign {campaign_id} not found for sending batch.")
+        logger.error("Campaign %s not found for sending batch.", campaign_id)
         return 0
 
     sent_ok = 0
     with smtp_session(campaign.mailbox) as smtp_conn, imap_session(campaign.mailbox) as imap_conn:
-        # Ensure sent folder exists
+        # Ensure sent folder exists (ignore if it already does)
         try:
+            # Some servers return ('OK', [b'...']) if it exists; others error -> ignore.
             imap_conn.create(campaign.mailbox.sent_folder)
         except imaplib.IMAP4.error:
-            pass # Folder likely exists
+            pass
+        except Exception as e:
+            # Folder creation failure should never block sending
+            logger.warning("IMAP create folder failed (ignored): %s", e)
 
-        recipients = Recipient.objects.filter(id__in=recipient_ids, unsubscribed=False, campaign=campaign)
+        recipients = Recipient.objects.filter(
+            id__in=recipient_ids,
+            unsubscribed=False,
+            campaign=campaign
+        )
+
         for r in recipients:
+            # Idempotent message row; reuses previous Message-ID on retries
             msg_id = f"<{campaign.id}.{r.id}.{get_random_string(12)}@{campaign.mailbox.from_email.split('@')[-1]}>"
-            mi, created = MessageInstance.objects.get_or_create(
+            mi, _created = MessageInstance.objects.get_or_create(
                 campaign=campaign,
                 recipient=r,
                 defaults={"message_id": msg_id},
             )
             if mi.sent_at:
+                # Already sent; skip
                 continue
 
             try:
+                # Build MIME and raw bytes once
                 m = _build_email(campaign, r, mi)
                 raw = m.as_bytes()
-                
-                # SMTP send
+
+                # SMTP send (count as success if server accepts it)
                 to_addrs = [addr for _, addr in email.utils.getaddresses(m.get_all("To", []) or [])]
                 smtp_conn.send_message(m, from_addr=campaign.mailbox.from_email, to_addrs=to_addrs)
-                
-                # IMAP append
-                imap_conn.append(campaign.mailbox.sent_folder, r"(\Seen)", imaplib.Time2Internaldate(time.time()), raw)
-                
-                now = timezone.now()
-                mi.sent_at = now
-                mi.last_event_at = now
-                mi.save(update_fields=["sent_at", "last_event_at"])
                 sent_ok += 1
+
+                # Best-effort IMAP append with per-op timeout. Failure here does NOT decrement sent count.
+                try:
+                    with imap_op_timeout(imap_conn, IMAP_APPEND_TIMEOUT):
+                        imap_conn.append(
+                            campaign.mailbox.sent_folder,
+                            r"(\Seen)",
+                            imaplib.Time2Internaldate(time.time()),
+                            raw,
+                        )
+                except Exception as e:
+                    logger.warning("IMAP APPEND failed (ignored) for %s: %s", r.email, e)
+
+                # Mark as sent
+                now_ts = timezone.now()
+                mi.sent_at = now_ts
+                mi.last_event_at = now_ts
+                mi.save(update_fields=["sent_at", "last_event_at"])
+
             except Exception as e:
-                logger.exception(f"Failed to send to recipient {r.email} for campaign {campaign.id}: {e}")
+                # SMTP failure or other build/send error: log and continue with others
+                logger.exception("Failed to send to recipient %s for campaign %s: %s", r.email, campaign.id, e)
 
     return sent_ok
