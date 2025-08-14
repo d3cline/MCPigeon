@@ -11,11 +11,20 @@ from django.forms.models import model_to_dict
 from django.utils.crypto import get_random_string
 from mcp_server import MCPToolset
 
+# NEW: imports for bulk recipient posting
+from django.conf import settings
+from django.db import transaction
+from django.core.validators import validate_email
+from email.utils import parseaddr
+
 from .models import (Campaign, DeliveryEvent, Link, LinkClick, Mailbox,
                    MessageInstance, OpenEvent, Recipient)
 from .tasks import send_campaign_task
 
 log = logging.getLogger("mcp.campaigns")
+
+# NEW: configurable per-call cap for recipient ingestion
+MAX_RECIPIENT_BATCH = getattr(settings, "MCP_MAX_RECIPIENT_BATCH", 1000)
 
 
 # ────────────────────────────────────────────────────────────
@@ -257,24 +266,133 @@ class CampaignTools(MCPToolset):
             clone.status = Campaign.Status.DRAFT
             clone.name = new_name or f"Clone of {original.name}"
             clone.save() # save to get a PK for recipient relations
-            
+
             # Also clone recipients
             recipients = original.recipients.all()
             for r in recipients:
                 r.pk = None
                 r.campaign = clone
                 r.save()
-            
+
             return _serialize(clone)
         except ObjectDoesNotExist:
             return {"ok": False, "error": "Campaign not found", "id": cid}
 
+    # NEW: bulk recipient posting
+    def _post_recipients(self, payload: Dict[str, Any]):
+        """
+        Ingest up to MAX_RECIPIENT_BATCH recipients for a campaign in one call.
+        Accepts either strings ("Name <email>" or "email") or objects
+        {"email": "...", "name": "..."}.
+
+        Partial ingestion is allowed: if the payload length exceeds the per-call
+        cap, we ingest the first chunk and report `remaining` so callers can
+        paginate the next batch.
+        """
+        cid = payload["campaign_id"]
+        entries = payload.get("recipients") or []
+        on_conflict = (payload.get("on_conflict") or "skip").lower()  # "skip" | "update_name"
+
+        try:
+            _get(Campaign, cid)
+        except ObjectDoesNotExist:
+            return {"ok": False, "error": "Campaign not found", "id": cid, "max_batch": MAX_RECIPIENT_BATCH}
+
+        if not isinstance(entries, list) or not entries:
+            return {"ok": False, "error": "No recipients provided", "max_batch": MAX_RECIPIENT_BATCH}
+
+        # Accept as many as we can this call
+        batch = entries[:MAX_RECIPIENT_BATCH]
+        remaining = max(0, len(entries) - len(batch))
+
+        # Normalize, validate, and dedupe within this batch
+        normalized = {}  # email(lower)->name
+        invalid = []
+        for idx, raw in enumerate(batch):
+            try:
+                if isinstance(raw, str):
+                    guess_name, addr = parseaddr(raw)
+                    email = (addr or raw).strip().lower()
+                    name = (guess_name or "").strip()
+                elif isinstance(raw, dict):
+                    email = (raw.get("email") or "").strip().lower()
+                    name = (raw.get("name") or "").strip()
+                else:
+                    raise ValidationError("Unsupported recipient item type")
+
+                if not email:
+                    raise ValidationError("Missing email")
+
+                validate_email(email)
+
+                # Keep first non-empty name for a given email
+                if email not in normalized or (not normalized[email] and name):
+                    normalized[email] = name
+            except ValidationError as ve:
+                invalid.append({"index": idx, "input": raw, "error": str(ve)})
+
+        if not normalized and not invalid:
+            return {
+                "ok": False,
+                "error": "No valid recipients found in payload",
+                "max_batch": MAX_RECIPIENT_BATCH,
+            }
+
+        emails = list(normalized.keys())
+
+        # Preload existing recipients for this campaign
+        existing = {
+            r.email.lower(): r
+            for r in Recipient.objects.filter(campaign_id=cid, email__in=emails)
+        }
+
+        to_create = []
+        to_update = []
+        skipped_existing = 0
+
+        for email, name in normalized.items():
+            if email in existing:
+                if on_conflict == "update_name" and name and name != (existing[email].name or ""):
+                    r = existing[email]
+                    r.name = name
+                    to_update.append(r)
+                else:
+                    skipped_existing += 1
+            else:
+                to_create.append(Recipient(campaign_id=cid, email=email, name=name))
+
+        with transaction.atomic():
+            if to_create:
+                Recipient.objects.bulk_create(to_create, batch_size=1000)
+            if to_update:
+                Recipient.objects.bulk_update(to_update, ["name"])
+
+        created = len(to_create)
+        updated = len(to_update)
+
+        return {
+            "ok": True,
+            "campaign_id": cid,
+            "accepted": len(batch),           # how many we attempted this call
+            "max_batch": MAX_RECIPIENT_BATCH, # tell the LLM how to paginate
+            "remaining": remaining,           # still to send from original payload
+            "created": created,
+            "updated": updated,
+            "skipped_existing": skipped_existing,
+            "invalid_count": len(invalid),
+            "invalid": invalid,               # per-item errors (index + reason)
+            "ingest_hint": (
+                "If remaining > 0, send the next chunk of up to max_batch items "
+                "in a subsequent call."
+            ),
+        }
 
     def campaigns(
         self,
         action: Literal[
             "list", "read", "create", "update", "delete",
-            "send", "status", "add_recipient", "list_recipients", "clone"
+            "send", "status", "add_recipient", "list_recipients", "clone",
+            "post_recipients"               # NEW
         ],
         payload: Dict[str, Any] | None = None,
     ):
@@ -301,6 +419,7 @@ class CampaignTools(MCPToolset):
                 - add_recipient
                 - list_recipients
                 - clone
+                - post_recipients
             payload: { type: object }
           required: [action]
 
@@ -387,6 +506,47 @@ class CampaignTools(MCPToolset):
                 campaign_id: {type: integer}
                 new_name: {type: string, description: "Optional new name for the cloned campaign."}
               required: [campaign_id]
+          post_recipients:
+            summary: |
+              Bulk-ingest recipients for a campaign. Accepts up to `max_batch`
+              per call and returns `remaining` so callers can paginate.
+              Items may be strings ("Name <email>" or "email") or objects
+              {"email": "...", "name": "..."}.
+            payload:
+              type: object
+              properties:
+                campaign_id: {type: integer}
+                recipients:
+                  type: array
+                  minItems: 1
+                  items:
+                    oneOf:
+                      - {type: string}
+                      - type: object
+                        properties:
+                          email: {type: string}
+                          name: {type: string}
+                        required: [email]
+                on_conflict:
+                  type: string
+                  enum: ["skip", "update_name"]
+                  default: "skip"
+              required: [campaign_id, recipients]
+            response:
+              type: object
+              properties:
+                ok: {type: boolean}
+                campaign_id: {type: integer}
+                accepted: {type: integer, description: "How many items we attempted this call"}
+                max_batch: {type: integer, description: "Per-call ingestion cap"}
+                remaining: {type: integer, description: "How many from the original payload still need posting"}
+                created: {type: integer}
+                updated: {type: integer}
+                skipped_existing: {type: integer}
+                invalid_count: {type: integer}
+                invalid:
+                  type: array
+                  items: {type: object}
         ...
         """
         payload = payload or {}
@@ -402,6 +562,7 @@ class CampaignTools(MCPToolset):
                 "add_recipient": self._add_recipient,
                 "list_recipients": self._list_recipients,
                 "clone": self._clone,
+                "post_recipients": self._post_recipients,  # NEW
             }
             return action_map[action](payload)
         except (KeyError, ValidationError, ObjectDoesNotExist) as e:
