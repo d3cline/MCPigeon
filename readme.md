@@ -1,382 +1,237 @@
 ![MC Pigeon](./logo.png)
+
 # MC Pigeon
 
-> An IMAP-first, Django-powered email campaign engine with SMTP send, IMAP APPEND, open/click tracking, and one-click unsubscribe. Markdown-only templates with auto text fallback and an auto-appended tracking pixel. Built to work great from the Django Admin and with MCP tools for agents.
+**MCP-native, IMAP-first email campaigns.**
+Markdown in → thousands out. Drive everything from an AI agent (VS Code or any MCP client). Tracks opens/clicks, appends to your **Sent** via IMAP, and handles bounces/replies.&#x20;
 
-*   **Stack**: Python 3.13, Django 5+, Celery 5+, PostgreSQL (recommended)
-*   **Why IMAP-first?**: Your mail lives in your own mailbox, making it auditable and portable. No vendor lock-in. All sends are automatically saved to your `Sent` folder.
-
----
-
-## Features
-
-*   **Campaigns & Recipients**: Manage campaigns and per-recipient message tracking.
-*   **SMTP & IMAP**: Sends via SMTP and appends a copy to your IMAP `Sent` folder.
-*   **IMAP Sync**: Scans your `bounce_folder` for bounces and replies, updating campaign stats.
-*   **Tracking**:
-    *   **Opens**: A tracking pixel is auto-appended to all HTML emails.
-    *   **Clicks**: All links are automatically rewritten for tracking.
-*   **Unsubscribe**: A visible unsubscribe link and `List-Unsubscribe` headers are added automatically.
-*   **Asynchronous Sending**: All campaigns are sent in the background using Celery for reliability and scale.
-*   **Admin UI**: A clean Django Admin interface with actions to enqueue campaigns and view detailed stats.
-*   **MCP Tools**: A full suite of tools for programmatic control by AI agents.
+* **Stack:** Python 3.13 • Django 5+ • Celery 5+ • Postgres (recommended)
+* **Core surfaces:** **MCP tools** (primary), Django Admin, CLI.&#x20;
 
 ---
 
-## Quickstart
-
-This project is a standard Django app. The quickest way to get started is to clone the repository and set up the environment.
-
-### 1. Setup
+## 1) Install
 
 ```bash
-# Clone the repository
-git clone <repository_url> mcpigeon
+git clone <repo_url> mcpigeon
 cd mcpigeon
-
-# Create and activate a virtual environment
-python3 -m venv env
-source env/bin/activate
-
-# Install dependencies
+python3 -m venv env && source env/bin/activate
 pip install -r requirements.in
 ```
 
-### 2. Configuration
-
-In your `MCPigeon/settings.py`:
+Minimal settings in `MCPigeon/settings.py`:
 
 ```python
-# settings.py
+# Public base for tracked URLs & pixel
+CAMPAIGNS_PUBLIC_BASE_URL = "https://your.app"  # required by template tags
 
-# Required for tracking links, unsubscribe URLs, etc.
-CAMPAIGNS_PUBLIC_BASE_URL = "https://your.domain.com"
-
-# Celery configuration (example using Redis)
+# Celery (example: Redis)
 CELERY_BROKER_URL = "redis://localhost:6379/0"
 CELERY_RESULT_BACKEND = "redis://localhost:6379/0"
 
-# Batch size for sending emails via Celery
-CAMPAIGNS_BATCH_SIZE = 100
+# MCP recipient ingest per-call cap (default 1000)
+MCP_MAX_RECIPIENT_BATCH = 1000
 ```
 
-### 3. Database & Server
+(Template tags build click/pixel URLs off `CAMPAIGNS_PUBLIC_BASE_URL`.)&#x20;
+
+Database & superuser:
 
 ```bash
-# Run database migrations
 python manage.py migrate
-
-# Create a superuser to access the admin
 python manage.py createsuperuser
-
-# Start the Django development server
-python manage.py runserver
 ```
 
-### 4. Run Celery Worker
-
-In a separate terminal, start the Celery worker:
+Run web + worker:
 
 ```bash
-# Make sure your virtual environment is activated
-source env/bin/activate
-
-# Start the worker
-celery -A MCPigeon worker -l info
+python manage.py runserver 0.0.0.0:8000
+# new shell
+export DJANGO_SETTINGS_MODULE=MCPigeon.settings
+celery -A campaigns.sender:app worker -l info
 ```
 
-You can now access the Django Admin at `http://127.0.0.1:8000/admin/`.
+> The task pipeline is idempotent and retries on transient DB errors; it sends a failure report email when a run completes.&#x20;
 
 ---
 
-## Usage
+## 2) Model shape (you’ll see these in Admin)
 
-1.  **Create a Mailbox**: In the admin, go to `Campaigns > Mailboxes` and add your SMTP/IMAP credentials. This is where your emails will be sent from.
-2.  **Create a Campaign**: Go to `Campaigns > Campaigns` and create a new campaign. Write your email content in Markdown.
-3.  **Add Recipients**: Add recipients to your campaign directly in the admin interface.
-4.  **Enqueue for Sending**: From the `Campaigns` list view, select your campaign and choose the **"Enqueue selected campaigns for sending"** action. The Celery worker will pick it up and start sending.
-
----
-
-## Data Model
-
-*   **Mailbox**: Stores SMTP & IMAP credentials, `sent_folder`, and `bounce_folder`.
-*   **Campaign**: The core email to be sent, including subject and Markdown content.
-*   **Recipient**: An email address associated with a campaign.
-*   **MessageInstance**: A per-recipient record tracking the status of an email (sent, opened, bounced, etc.).
-*   **Link / LinkClick**: For tracking URL clicks.
-*   **OpenEvent**: For tracking email opens via the pixel.
-*   **DeliveryEvent**: For recording bounces, replies, and other delivery-related events from the IMAP sync.
+* **Mailbox**: SMTP/IMAP creds + `sent_folder`, `bounce_folder`.
+* **Campaign**: `name`, `subject`, `mailbox`, `template_markdown`, `status`.
+* **Recipient**: unique per (`campaign`,`email`), optional `name`, `unsubscribed`, `meta`.
+* **MessageInstance**: one per recipient send; holds `message_id`, timestamps, click count.
+* **Link / LinkClick / OpenEvent / DeliveryEvent**: tracking artifacts.&#x20;
 
 ---
 
-## Templates (Markdown + tracking helpers)
+## 3) MCP (the primary interface)
 
-Enable the tag library by placing `campaigns/templatetags/campaigns.py`.
+This repo exposes **MCP tools** you can mount in your MCP host (VS Code, Claude Desktop, Cursor/Cline/Continue, etc.). Tools:
 
-```markdown
-Hey {{ recipient.name|default:"there" }}!
+* `mailboxes` — CRUD + verify creds + optional remote provisioning.&#x20;
+* `campaigns` — CRUD + **send**, **status**, **list\_recipients**, **add\_recipient**, **clone**, **post\_recipients** (bulk).&#x20;
+* `campaign_mailbox` — assign/switch a campaign’s mailbox.&#x20;
 
-[Open link]({% track_url campaign recipient 'https://example.com' %})
+**Mounting (typical local config):**
 
-<img src="{% tracking_pixel message %}" width="1" height="1" style="display:none" alt="">
+* **Command:** your MCP host’s “add local tool/server” pointing at the Python that imports `campaigns.mcp` (stdio).
+* **Env:** `DJANGO_SETTINGS_MODULE=MCPigeon.settings` (and your Django env vars).
+* **CWD:** repo root.
+
+### Common MCP calls
+
+**Create a mailbox, then verify creds**
+
+```json
+{"tool":"mailboxes","action":"create","payload":{
+  "name":"Sales","from_name":"Sales","from_email":"sales@your.app",
+  "smtp_host":"smtp.your.app","smtp_port":587,"smtp_starttls":true,
+  "smtp_username":"sales@your.app","smtp_password":"***",
+  "imap_host":"imap.your.app","imap_port":993,"imap_ssl":true,
+  "imap_username":"sales@your.app","imap_password":"***",
+  "sent_folder":"Sent","bounce_folder":"INBOX"
+}}
 ```
 
-Context available in templates (provided automatically at send time):
+```json
+{"tool":"mailboxes","action":"verify","payload":{"id":1}}
+```
 
-- `campaign`, `recipient`, `message`
-- `public_base_url` — from `settings.CAMPAIGNS_PUBLIC_BASE_URL`
-- `unsubscribe_url` — `${public_base_url}/campaigns/unsub/{{ recipient.id }}/`
-- `open_url` — `${public_base_url}/campaigns/o/{{ message.id }}/p.png` (pixel URL)
-- `tracking_pixel` — `<img src="{{ open_url }}" alt="" width="1" height="1" style="display:none">` (uses pixel URL)
+(Verify attempts real SMTP/IMAP logins and returns pass/fail + errors.)&#x20;
 
-Notes:
+**Create a campaign**
 
-- `{% track_url %}` returns a redirect URL for click tracking (use inside Markdown links).
-- `{% tracking_pixel %}` is optional now. A tracking pixel is auto-appended to the HTML if the pixel URL (`open_url`) isn’t already present, so you can omit it in content.
-- We render Django Template first, then convert Markdown → HTML; plaintext is auto-derived from HTML.
+```json
+{"tool":"campaigns","action":"create","payload":{
+  "name":"September Promo",
+  "subject":"Save big this month",
+  "mailbox_id":1,
+  "template_markdown":"Hey {{ recipient.name|default:\"there\" }} — check this out!"
+}}
+```
 
-Authentication for MCP/CLI:
 
-- Personal access tokens (PATs) are derived deterministically from the Django `User.password` hash using HMAC-SHA256.
-- Each user’s read-only PAT is visible on their User admin page; it rotates when the password changes.
+
+**Bulk-import recipients (strings or objects)**
+
+```json
+{"tool":"campaigns","action":"post_recipients","payload":{
+  "campaign_id":123,
+  "on_conflict":"update_name",
+  "recipients":[
+    "Ada Lovelace <ada@ex.com>",
+    {"email":"grace@ex.com","name":"Grace Hopper"},
+    "alan@ex.com"
+  ]
+}}
+```
+
+* Accepts up to `MCP_MAX_RECIPIENT_BATCH` per call; returns `remaining` for pagination.
+* Validates emails; dedupes within the batch; can update names on conflicts.&#x20;
+
+**Send (queued via Celery)**
+
+```json
+{"tool":"campaigns","action":"send","payload":{"campaign_id":123}}
+```
+
+Check progress:
+
+```json
+{"tool":"campaigns","action":"status","payload":{"campaign_id":123}}
+```
+
+(Status reports sent/opened/bounced/clicks + last event.)&#x20;
+
+**Switch a campaign’s mailbox**
+
+```json
+{"tool":"campaign_mailbox","action":"assign","payload":{"campaign_id":123,"mailbox_id":2}}
+```
+
+
+
+> Implementation note: each recipient gets a stable RFC5322 Message-ID like `<uuid.campaignId.recipientId@domain>`, which the IMAP sync uses to reconcile replies/bounces.
 
 ---
 
-## Management Commands (CLI)
+## 4) Django Admin (supporting surface)
 
-### 1) Send a campaign
+* Add a **Mailbox** with working SMTP/IMAP creds.
+* Create a **Campaign** (Markdown body).
+* Add **Recipients** (or use MCP bulk ingest).
+* Enqueue/send from Admin actions *or* use MCP/CLI.
+  (Status and events are visible via related models.)&#x20;
 
-Sends via SMTP and APPENDs raw message to your IMAP **Sent** folder.
+---
+
+## 5) CLI (supporting surface)
+
+**Send (sync or enqueue)**
 
 ```bash
-# By numeric ID
 python manage.py campaign_send --campaign 123
-
-# Dry-run (render/build but DO NOT send/append)
 python manage.py campaign_send --campaign 123 --dry-run
-
-# By fuzzy name (uses most recent match)
-python manage.py campaign_send --name "Vibe Deploy"
-
-# Tune throughput for this run
-python manage.py campaign_send --campaign 123 --batch-size 100 --sleep 1.5
+python manage.py campaign_send --name "September Promo" --enqueue --batch-size 200 --sleep 1.5
 ```
 
-What it does:
+* `--enqueue` splits recipients and schedules chunk tasks.&#x20;
 
-* Marks status `SENDING` → `DONE` when finished.
-* Uses `CAMPAIGNS_BATCH_SIZE` and `CAMPAIGNS_SLEEP_BETWEEN_BATCHES_SEC` unless overridden.
-* Calls the same core function used by Admin actions: `campaigns.sender.send_campaign(...)`.
+**Enqueue directly**
 
-Performance notes:
+```bash
+python manage.py campaign_enqueue --campaign 123 --chunk-size 300
+```
 
-- The sender reuses SMTP and IMAP connections within chunks to reduce connection overhead.
-- For very large lists, enqueue chunks via Celery (see below) instead of one long synchronous run.
+(Uses `send_campaign_chunk.delay` per chunk.)&#x20;
 
-### 2) IMAP sync (bounces & replies)
-
-Polls your `bounce_folder` (often `INBOX`) and records delivery events.
+**IMAP sync (bounces/replies)**
 
 ```bash
 python manage.py campaign_imap_sync
 ```
 
-What it does:
-
-* Tries to match messages to `MessageInstance` via `In-Reply-To/References` or the custom `Message-ID` pattern `<campaignId.recipientId.random@domain>`.
-* Sets `bounced_at` timestamps on DSNs.
-* Creates `DeliveryEvent` rows (`BOUNCE`, `REPLY`, `DEFERRED` — basic heuristic).
-
-### Suggested scheduling
-
-**systemd (recommended)**
-
-```ini
-# /etc/systemd/system/mcpigeon-imap-sync.service
-[Unit]
-Description=MC Pigeon IMAP sync
-
-[Service]
-Type=oneshot
-WorkingDirectory=/srv/app             # ← change me
-Environment="DJANGO_SETTINGS_MODULE=myproj.settings"
-ExecStart=/srv/app/venv/bin/python manage.py campaign_imap_sync
-```
-
-```ini
-# /etc/systemd/system/mcpigeon-imap-sync.timer
-[Unit]
-Description=Run IMAP sync every 5 minutes
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=5min
-Unit=mcpigeon-imap-sync.service
-
-[Install]
-WantedBy=timers.target
-```
-
-```bash
-systemctl daemon-reload
-systemctl enable --now mcpigeon-imap-sync.timer
-```
-
-**Cron (simple alternative)**
-
-```cron
-*/5 * * * * cd /srv/app && /srv/app/venv/bin/python manage.py campaign_imap_sync >> /var/log/mcpigeon_imap.log 2>&1
-```
+* Logs into each campaign mailbox’s `bounce_folder`, processes **UNSEEN**, marks `\Seen`.
+* Classifies **BOUNCE/DEFERRED/REPLY**; sets `bounced_at` and records `DeliveryEvent`.
+* Matches messages by our `Message-ID` pattern `<campaignId.recipientId.rnd@domain>`.&#x20;
 
 ---
 
-## Admin
+## 6) Writing templates (Markdown + tags)
 
-Drop in `campaigns/admin.py` (provided). Highlights:
+Enable the tags by keeping `campaigns/templatetags/campaigns.py` in the app. Use:
 
-* Campaign list shows recipient/sent/open/bounce counts & open rate
-* Actions:
+```markdown
+Hey {{ recipient.name|default:"there" }}!
 
-  * **Send selected campaigns (DRY RUN)**
-  * **Send selected campaigns (LIVE)**
-  * **Enqueue selected campaigns (Celery, chunked)**
-  * **IMAP sync now**
-  * **Export recipients (CSV)**
-
-User admin:
-
-* The API PAT token is shown read-only on each user page (derived from the password hash; it rotates on password change).
-
-Passwords are masked in forms but stored as provided (use secrets management in production).
-
----
-
-## Asynchronous sending (Celery)
-
-For high volume, run chunked sends via Celery workers.
-
-1) Configure a broker (example: Redis) and install Celery (see Install).
-2) Set environment and run a worker that loads the in-module app at `campaigns.sender:app`.
-
-Environment (example):
-
-```bash
-export DJANGO_SETTINGS_MODULE=MCPigeon.settings
-export CELERY_BROKER_URL=redis://localhost:6379/0
-export CELERY_RESULT_BACKEND=redis://localhost:6379/0
+[Open link]({% track_url campaign recipient "https://example.com" %})
+<img src="{% tracking_pixel message %}" width="1" height="1" style="display:none" alt="">
 ```
 
-Run worker:
-
-```bash
-celery -A campaigns.sender:app worker -l info
-```
-
-Enqueue chunks from CLI:
-
-```bash
-# Option 1: one-shot enqueue via dedicated command
-python manage.py campaign_enqueue --campaign 123 --chunk-size 200
-
-# Option 2: send command with enqueue flag (skips SMTP/IMAP locally and just enqueues)
-python manage.py campaign_send --campaign 123 --enqueue
-```
-
-Details:
-
-- Tasks live in `campaigns/sender.py`; the Celery task name is `campaigns.send_campaign_chunk`.
-- The worker process must have `DJANGO_SETTINGS_MODULE` set so the ORM works.
-- `CELERY_BROKER_URL`/`CELERY_RESULT_BACKEND` can be provided via env; settings read them and pass to Celery.
+* `{% track_url %}` rewrites to a tracked redirect under `CAMPAIGNS_PUBLIC_BASE_URL`.
+* `{% tracking_pixel %}` emits the 1×1 open-tracking URL.&#x20;
 
 ---
 
-## HTTP Endpoints
+## 7) Notes on sending & resilience
 
-Already wired by `campaigns/urls.py`:
-
-* `GET /campaigns/t/<token>/r/<recipient_id>/` → 302 redirect + click log
-* `GET /campaigns/o/<message_id>/p.png` → 1×1 tracking pixel + open log (no-cache)
-* `GET /campaigns/unsub/<recipient_id>/` → marks unsubscribed
-
-Headers added automatically:
-
-```
-List-Unsubscribe: <https://your.app/campaigns/unsub/{recipient_id}/>
-List-Unsubscribe-Post: List-Unsubscribe=One-Click
-```
-
-Notes:
-
-- The unsubscribe headers are only added when `CAMPAIGNS_PUBLIC_BASE_URL` is configured.
+* Task `campaigns.send_campaign` is idempotent; re-runs skip already-sent recipients.
+* Per-recipient failures don’t abort the run; a summary email is sent at the end.
+* On DB hiccups, the task retries with backoff/jitter.&#x20;
 
 ---
 
-## Deliverability Checklist
+## 8) Deliverability (bare minimum)
 
-* Configure **SPF**, **DKIM**, **DMARC** on your sending domain
-* Warm up with batch throttling (`CAMPAIGNS_BATCH_SIZE`, sleeps)
-* Include visible **unsubscribe** & physical address
-* Keep a clean list; honor `unsubscribed` and bounces
-
----
-
-## Security, Privacy & Compliance
-
-* Treat recipient data and activity logs as **PII**
-* Enforce **TLS** on SMTP/IMAP
-* Disclose **tracking**; offer text-only alternative
-* Follow CAN-SPAM/GDPR/etc. for your jurisdiction
-
----
-
-## Scaling notes
-
-* Run sends via **Celery/RQ** (wrap `send_campaign`) for large lists
-* Add DB indexes on `MessageInstance(campaign_id, recipient_id)` and event timestamps
-* Optionally front pixel/redirect endpoints with a CDN (cache-bypass pixel)
-
----
-
-## MCP
-
-MCP tools are included for CRUD and ops (send/status). Campaigns use `template_markdown` (Markdown-only) in the tool schemas. The MCP manifest exposes `env.public_base_url` so agents can generate correct tracking/unsubscribe links and tracking pixels in Markdown.
-
-* `campaigns` (CRUD), `recipients` (CRUD), `messages`, `links`, `linkclicks`, `openevents`, `deliveryevents`, `campaign_ops` (send/status/add_recipient)
-
-These call the same core sender/stats functions as the Admin/CLI. Wire once you’re happy with the core.
-
----
-
-## Troubleshooting
-
-**No messages in “Sent”**
-
-* Verify IMAP creds & `sent_folder` spelling/casing
-* Confirm `_imap_append` runs after `_smtp_send`
-
-**Links don’t track**
-
-* Ensure `CAMPAIGNS_PUBLIC_BASE_URL` is correct & routable
-* Use `{% track_url %}` inside Markdown link URLs: `[text]({% track_url ... %})`
-
-**Opens look low**
-
-* Many clients block images; opens are a floor, not truth
-
-**IMAP sync finds nothing**
-
-* Check `bounce_folder` and remove `UNSEEN` filter temporarily for testing
+Set up **SPF/DKIM/DMARC**, warm up with smaller batches + sleeps, include unsubscribe, and honor bounces/unsubs. (Clicks/opens depend on client behavior.)
 
 ---
 
 ## License
 
-**GPL-3.0** — strong copyleft for a community-friendly, self-hosted tool.
+Apache-2.0
 
 ---
 
-## Credits
-
-Built for agentic workflows by folks who like their email where they can see it — **in the mailbox**.
-Mascot & brand: **MC Pigeon** 🐦🎤 (vibe coded in 36 hours off a prime and bag of twizzlers, and the help of gemini, Sonnet, and GPT 5. Logo sora.)
+Mail stays where it belongs: **your mailbox**. Your **agent** runs the show.
