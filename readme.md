@@ -8,6 +8,8 @@ Markdown in → thousands out. Drive everything from an AI agent (VS Code or any
 * **Stack:** Python 3.13 • Django 5+ • Celery 5+ • Postgres (recommended)
 * **Core surfaces:** **MCP tools** (primary), Django Admin, CLI.&#x20;
 
+[📹➡️Demo Video Here➡️📹 ](https://www.opalstack.com/blog/wp-content/uploads/2025/08/2025-08-13-10-04-00.mp4)
+
 ---
 
 ## 1) Install
